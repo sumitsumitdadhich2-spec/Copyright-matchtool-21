@@ -130,9 +130,14 @@ interface Job {
    *  Set after every request from its actual token size so every model runs at full TPM capacity. */
   nextFreeAt: Record<string, number>
   cooldownUntil: Record<string, number>
+  /** buffer cooldown per chunkIndex to prevent rapid-fire token spikes when an attempt fails */
+  chunkRetryCooldown: Map<number, { availableAt: number; reason: string; failedModel: string; failedKey: number }>
   dirty: boolean
   saverTimer: ReturnType<typeof setInterval> | null
 }
+
+/** Pacing buffer delay (ms) applied when a chunk fails, preventing rapid-fire cascading token spikes */
+export const CHUNK_RETRY_BUFFER_MS = 6_000
 
 /** Max attempts (non-rate errors) per candidate group before it is kept as unverified. */
 const MAX_GROUP_ATTEMPTS = 4
@@ -408,6 +413,7 @@ class Scheduler {
       stopping: false,
       nextFreeAt: {},
       cooldownUntil: {},
+      chunkRetryCooldown: new Map(),
       dirty: true,
       saverTimer: null,
     }
@@ -936,22 +942,30 @@ class Scheduler {
   }
 
   /** LANE AFFINITY & LOCK RESPECT: pull the next chunk for this lane.
+   *  Respects chunkRetryCooldown to prevent rapid-fire retries after errors.
    *  1. Prefer chunk already pre-uploaded by THIS key.
    *  2. Prefer chunk pre-locked specifically for THIS key.
    *  3. Unclaimed chunk in queue.
    *  4. If all remaining chunks in queue are locked by other active lanes, do not steal them. */
   private pullChunkFor(job: Job, lane: KeyLane): number | undefined {
     if (job.queue.length === 0) return undefined
-    let pos = job.queue.findIndex((ci) => lane.chunkUploads.has(ci))
-    if (pos < 0) pos = job.queue.findIndex((ci) => job.prefetchOwner.get(ci) === lane.idx)
-    if (pos < 0) pos = job.queue.findIndex((ci) => !job.prefetchOwner.has(ci))
+    const now = Date.now()
+    const isEligible = (ci: number) => {
+      const info = job.chunkRetryCooldown?.get(ci)
+      return !info || info.availableAt <= now
+    }
+
+    let pos = job.queue.findIndex((ci) => isEligible(ci) && lane.chunkUploads.has(ci))
+    if (pos < 0) pos = job.queue.findIndex((ci) => isEligible(ci) && job.prefetchOwner.get(ci) === lane.idx)
+    if (pos < 0) pos = job.queue.findIndex((ci) => isEligible(ci) && !job.prefetchOwner.has(ci))
     if (pos < 0) {
       const otherActiveOwners = job.lanes.filter(
         (l) => l.idx !== lane.idx && CHUNK_MODEL_POOL.some((m) => !globalGeminiCoordinator.isModelExhausted(l.apiKey, m.id, m.rpd)),
       )
       if (otherActiveOwners.length > 0) return undefined
-      pos = 0
+      pos = job.queue.findIndex((ci) => isEligible(ci))
     }
+    if (pos < 0) return undefined
     return job.queue.splice(pos, 1)[0]
   }
 
@@ -1308,35 +1322,13 @@ class Scheduler {
         // background so the next pass starts instantly.
         this.prepareNextSegment(job, segments, seg.index)
 
-        // CHUNK PIPELINE: Staggered model start per lane.
-        // For each lane, start ONLY the first model (pick primary rotated by keyIdx % modelCount),
-        // wait for that lane's first chunk to succeed, and only then launch the remaining models for that lane.
+        // CHUNK PIPELINE: STRICT 1-WORKER-PER-KEY-LANE.
+        // On ANY single API key, exactly ONE chunk request is processed at a time.
+        // No 2 models (e.g. 3.8 and 3.6) can ever execute in parallel on the same key lane!
+        // This eliminates TPM spikes (~3.65 Lakh tokens/min) and protects API keys from quota exhaustion.
         job.laneFirstSuccess.clear()
         const lanePromises = job.lanes.map(async (lane) => {
-          const modelCount = CHUNK_MODEL_POOL.length
-          if (modelCount === 0) return
-          const primaryIdx = lane.idx % modelCount
-          const primaryModel = CHUNK_MODEL_POOL[primaryIdx]
-          const secondaryModels = CHUNK_MODEL_POOL.filter((_, idx) => idx !== primaryIdx)
-
-          const primaryWorkerPromise = this.worker(job, lane, primaryModel)
-          const laneWorkers: Promise<void>[] = [primaryWorkerPromise]
-
-          if (secondaryModels.length > 0) {
-            const launchRemaining = async () => {
-              while (!job.stopping && !job.laneFirstSuccess.has(lane.idx)) {
-                if (job.queue.length === 0 && job.inFlight.size === 0) break
-                await sleep(500)
-              }
-              if (!job.stopping && job.laneFirstSuccess.has(lane.idx) && (job.queue.length > 0 || job.inFlight.size > 0)) {
-                const secondaries = secondaryModels.map((m) => this.worker(job, lane, m))
-                await Promise.all(secondaries)
-              }
-            }
-            laneWorkers.push(launchRemaining())
-          }
-
-          await Promise.all(laneWorkers)
+          await this.laneWorker(job, lane)
         })
         await Promise.all(lanePromises)
         // Catch any candidates merged by the very last chunk.
@@ -2839,38 +2831,72 @@ class Scheduler {
     this.buildCandidateGroups(scan)
   }
 
-  /** Worker: one per (key lane × model). Pulls chunks from the shared queue until drained. */
-  private async worker(job: Job, lane: KeyLane, m: ModelSpec) {
-    const { scan } = job
+  /** Helper to re-queue a failed chunk with a mandatory 6-second pacing buffer to prevent rapid-fire token spikes */
+  private requeueFailedChunk(job: Job, chunkIndex: number, failedModel: string, failedKeyIdx: number, reason: string, minutePrefix: string) {
+    const chunk = job.scan.chunks[chunkIndex]
+    if (chunk) chunk.status = 'pending'
+    job.queue.push(chunkIndex)
+    job.chunkRetryCooldown.set(chunkIndex, {
+      availableAt: Date.now() + CHUNK_RETRY_BUFFER_MS,
+      reason: reason.slice(0, 80),
+      failedModel,
+      failedKey: failedKeyIdx,
+    })
+    addLog(
+      job.scan,
+      'info',
+      `${minutePrefix}Chunk ${chunkIndex}: 6s pacing buffer active after ${displayModelName(failedModel)} (key ${failedKeyIdx}) attempt — preventing rapid-fire token spikes before next handoff/retry.`,
+    )
+  }
+
+  /** Worker: one per KEY LANE.
+   *  STRICT 1-WORKER-PER-KEY: exactly ONE chunk request is active on an API key at a time.
+   *  Rotates to fallback models sequentially if primary is cooling or exhausted. */
+  private async laneWorker(job: Job, lane: KeyLane) {
+    const modelCount = CHUNK_MODEL_POOL.length
+    if (modelCount === 0) return
 
     while (true) {
       if (job.stopping) return
 
       // IMMEDIATE MINUTE COMPLETION CHECK:
-      // If queue is empty AND no chunks are in flight, this minute's scanning is 100% done!
-      // Exit worker immediately so lanePromises resolve without delay!
       if (job.queue.length === 0 && job.inFlight.size === 0) {
-        const st = this.modelState(job, lane, m)
-        if (st.state !== 'idle' && st.state !== 'exhausted') {
-          st.state = 'idle'
-          st.currentChunk = null
-          this.mark(job)
+        for (const item of CHUNK_MODEL_POOL) {
+          const st = this.modelState(job, lane, item)
+          if (st.state !== 'idle' && st.state !== 'exhausted') {
+            st.state = 'idle'
+            st.currentChunk = null
+          }
         }
+        this.mark(job)
         return
+      }
+
+      // Determine active model for this key lane:
+      // Primary model rotated by key index, or fallback if exhausted for today.
+      const primaryIdx = lane.idx % modelCount
+      const primaryModel = CHUNK_MODEL_POOL[primaryIdx]
+      const secondaryModels = CHUNK_MODEL_POOL.filter((_, idx) => idx !== primaryIdx)
+
+      let m = primaryModel
+      if (globalGeminiCoordinator.isModelExhausted(lane.apiKey, primaryModel.id, primaryModel.rpd)) {
+        const fallback = secondaryModels.find((cand) => !globalGeminiCoordinator.isModelExhausted(lane.apiKey, cand.id, cand.rpd))
+        if (!fallback) {
+          // All models exhausted for today on this API key!
+          const laneState = job.scan.keyLanes?.find((l) => l.idx === lane.idx)
+          if (laneState) laneState.status = 'exhausted'
+          for (const item of CHUNK_MODEL_POOL) {
+            const st = this.modelState(job, lane, item)
+            st.state = 'exhausted'
+            st.currentChunk = null
+          }
+          this.mark(job)
+          return
+        }
+        m = fallback
       }
 
       const st = this.modelState(job, lane, m)
-
-      // Fast RPD check via coordinator — instant background check, never send request N+1 past daily cap.
-      if (globalGeminiCoordinator.isModelExhausted(lane.apiKey, m.id, m.rpd)) {
-        if (st.state !== 'exhausted') {
-          st.state = 'exhausted'
-          st.currentChunk = null
-          addLog(scan, 'warn', `${m.id} (key ${lane.idx}) exhausted for today (${m.rpd}/${m.rpd} RPD) — removed from pool`)
-          this.mark(job)
-        }
-        return
-      }
 
       // Cooldown check (RPM/TPM-type 429).
       const cool = job.cooldownUntil[this.rateKey(lane, m)] || 0
@@ -2896,10 +2922,7 @@ class Scheduler {
       st.cooldownUntil = null
 
       // Global Coordinator Availability check:
-      // If this specific key/model lane is currently busy (working in another scan or in pacing delay),
-      // sleep 1 second and DO NOT pull chunk yet.
-      // This allows any other worker on an idle/free key (e.g. Key 3 · gemini-3.8, Key 2 · gemini-3.6)
-      // to pull from job.queue immediately without any wait!
+      // If this key or model is currently busy (working or in pacing delay), wait 1 second
       const laneBusy = globalGeminiCoordinator.isLaneBusy(lane.apiKey, m.id, 0)
       if (laneBusy.busy) {
         if (job.queue.length === 0 && job.inFlight.size === 0) {
@@ -2916,9 +2939,7 @@ class Scheduler {
         continue
       }
 
-      // Pull next chunk (lane affinity: this key's pre-uploaded chunk first).
-      // When the queue is empty but other workers are still in flight, wait —
-      // a failed chunk may be re-queued for retry.
+      // Pull next chunk (filters out chunks in retry buffer cooldown)
       const chunkIndex = this.pullChunkFor(job, lane)
       if (chunkIndex === undefined) {
         if (job.inFlight.size === 0 && job.queue.length === 0) {
@@ -2935,8 +2956,18 @@ class Scheduler {
         continue
       }
 
-      const chunk = scan.chunks[chunkIndex]
-      if (!chunk || chunk.status !== 'pending') continue
+      // Process this chunk on model `m`
+      await this.processChunk(job, lane, m, chunkIndex)
+    }
+  }
+
+  /** Process a single chunk on a specified key lane and model */
+  private async processChunk(job: Job, lane: KeyLane, m: ModelSpec, chunkIndex: number) {
+    const { scan } = job
+    const st = this.modelState(job, lane, m)
+
+    const chunk = scan.chunks[chunkIndex]
+    if (!chunk || chunk.status !== 'pending') return
       const seg = job.seg
       if (!seg) return
       const minutePrefix = (scan.shortSegments?.length ?? 0) > 1 ? `Minute ${seg.index + 1} · ` : ''
@@ -3500,7 +3531,7 @@ class Scheduler {
           job.queue.push(chunkIndex)
           addLog(scan, 'warn', `${minutePrefix}Chunk ${chunkIndex}: SUSPICIOUS output on ${m.id} — ${suspicion}. Auto-retry ${chunk.qualityRetries}/${MAX_QUALITY_RETRIES} queued`)
           this.mark(job)
-          continue
+          return
         }
         if (suspicion) {
           addLog(scan, 'warn', `Chunk ${chunkIndex}: output still suspicious after ${MAX_QUALITY_RETRIES} auto-retry (${suspicion}) — accepting result, use manual Retry if needed`)
@@ -3588,8 +3619,7 @@ class Scheduler {
             laneState.status = 'error'
             laneState.lastError = 'API key invalid or expired'
           }
-          chunk.status = 'pending'
-          job.queue.push(chunkIndex)
+          this.requeueFailedChunk(job, chunkIndex, m.id, lane.idx, 'API key invalid/expired', minutePrefix)
           addLog(scan, 'error', `API Key ${lane.idx} is invalid/expired — disabled for this scan; Chunk ${chunkIndex} re-queued for another key`)
         } else if (e.kind === 'overloaded') {
           const quotaOutcome = globalGeminiCoordinator.handleQuotaOrRateError(
@@ -3609,8 +3639,7 @@ class Scheduler {
             if (ms) ms.state = 'cooling'
           }
           addLog(scan, 'warn', `${m.id} (key ${lane.idx}): 503 overloaded — switching to another lane; Chunk ${chunkIndex} re-queued.`)
-          chunk.status = 'pending'
-          job.queue.push(chunkIndex)
+          this.requeueFailedChunk(job, chunkIndex, m.id, lane.idx, '503 overloaded', minutePrefix)
         } else if (e.kind === 'rpd' || e.kind === 'rate') {
           const quotaOutcome = globalGeminiCoordinator.handleQuotaOrRateError(
             lane.apiKey,
@@ -3640,25 +3669,21 @@ class Scheduler {
             }
             addLog(scan, 'warn', `${m.id} (key ${lane.idx}): ${quotaOutcome.reason}. Chunk ${chunkIndex} re-queued.`)
           }
-          chunk.status = 'pending'
-          job.queue.push(chunkIndex)
+          this.requeueFailedChunk(job, chunkIndex, m.id, lane.idx, quotaOutcome.reason, minutePrefix)
         } else if (e.kind === 'timeout' || /timed out|timeout/i.test(e.message)) {
-          chunk.status = 'pending'
-          job.queue.push(chunkIndex)
           const laneState = job.scan.keyLanes?.find((l) => l.idx === lane.idx)
           if (laneState) {
             const ms = laneState.models.find((item) => item.id === m.id)
             if (ms) ms.state = 'cooling'
           }
           addLog(scan, 'warn', `${m.id} (key ${lane.idx}): Request timed out after 3 minutes without response — Chunk ${chunkIndex} re-queued for next model/lane.`)
+          this.requeueFailedChunk(job, chunkIndex, m.id, lane.idx, 'Request timeout', minutePrefix)
         } else if (e.kind === 'empty') {
-          chunk.status = 'pending'
-          job.queue.push(chunkIndex)
           addLog(scan, 'warn', `${minutePrefix}Chunk ${chunkIndex}: empty response on ${m.id} (key ${lane.idx}) — diagnostic saved in AI Output; chunk safely re-queued for another worker`)
+          this.requeueFailedChunk(job, chunkIndex, m.id, lane.idx, 'Empty response', minutePrefix)
         } else {
-          chunk.status = 'pending'
-          job.queue.push(chunkIndex)
           addLog(scan, 'warn', `Chunk ${chunkIndex} attempt ${chunk.attempts}/${MAX_CHUNK_ATTEMPTS} failed on ${m.id} (key ${lane.idx}) — re-queued: ${e.message.slice(0, 120)}`)
+          this.requeueFailedChunk(job, chunkIndex, m.id, lane.idx, e.message.slice(0, 80), minutePrefix)
         }
         this.mark(job)
       } finally {
@@ -3675,7 +3700,6 @@ class Scheduler {
       }
     }
   }
-}
 
 const globalForScheduler = globalThis as unknown as { __cmtScheduler?: Scheduler }
 export const scheduler = globalForScheduler.__cmtScheduler || (globalForScheduler.__cmtScheduler = new Scheduler())

@@ -67,10 +67,25 @@ interface BreakerFailureEvent {
   failureClass: 'rate' | 'overloaded' | 'rpd'
 }
 
+export interface ActiveKeyExecution {
+  keyHash: string
+  keyIdx: number
+  scanId: string
+  scanTitle: string
+  modelId: string
+  operation: string
+  slot: number
+  activeSince: number
+}
+
 class GlobalGeminiCoordinator {
   private lanes = new Map<string, GlobalLaneState>()
   private verifyModelStates = new Map<string, VerifyModelState>()
   private chunkModelStates = new Map<string, ChunkModelState>()
+  /** Global Key-level exclusive lock: guarantees that on ANY single API key, NO two models or requests can EVER run in parallel! */
+  private activeKeyLocks = new Map<string, ActiveKeyExecution>()
+  /** Global Key-level pacing buffer: minimum spacing between ANY consecutive requests on the same key */
+  private keyNextFreeAt = new Map<string, number>()
   private currentActiveDay = geminiUsageDay()
   private breakerEvents: BreakerFailureEvent[] = []
   private globalPauseUntil: number = 0
@@ -93,6 +108,8 @@ class GlobalGeminiCoordinator {
       this.currentActiveDay = today
       this.exhaustedLogSet.clear()
       this.rateSpikeLogUntil.clear()
+      this.activeKeyLocks.clear()
+      this.keyNextFreeAt.clear()
       for (const lane of this.lanes.values()) {
         lane.isExhausted = false
         lane.cooldownUntil = 0
@@ -209,6 +226,7 @@ class GlobalGeminiCoordinator {
     const lane = this.getOrCreateLane(apiKey, modelId, slot)
     const now = Date.now()
     const used = getModelUsage(modelId, apiKey)
+    const kh = apiKeyHash(apiKey)
 
     // FINAL DECISION: Only setting quota determines daily exhaustion!
     if (used < rpdCap) {
@@ -219,6 +237,31 @@ class GlobalGeminiCoordinator {
         busy: true,
         exhausted: true,
         activeOperation: 'Exhausted for today',
+      }
+    }
+
+    // KEY-LEVEL EXCLUSIVE LOCK:
+    // If THIS API key is currently executing ANY request (even on another model like 3.8 vs 3.6 or verifier),
+    // this lane is strictly BUSY! Never allow 2 concurrent requests on the same key!
+    const activeKeyLock = this.activeKeyLocks.get(kh)
+    if (activeKeyLock) {
+      return {
+        busy: true,
+        activeScanId: activeKeyLock.scanId,
+        activeScanTitle: activeKeyLock.scanTitle,
+        activeOperation: `Key ${activeKeyLock.keyIdx || lane.keyIdx || ''} busy: ${displayModelName(activeKeyLock.modelId)} running (${activeKeyLock.operation})`,
+      }
+    }
+
+    // KEY-LEVEL PACING BUFFER:
+    const keyNextFree = this.keyNextFreeAt.get(kh) || 0
+    if (keyNextFree > now) {
+      const waitSec = Math.ceil((keyNextFree - now) / 1000)
+      return {
+        busy: true,
+        cooling: true,
+        waitSec,
+        activeOperation: `Key ${lane.keyIdx} pacing buffer (${waitSec}s)`,
       }
     }
 
@@ -255,6 +298,10 @@ class GlobalGeminiCoordinator {
    */
   public isKeyActiveInOtherScan(apiKey: string, currentScanId: string): boolean {
     const hash = apiKeyHash(apiKey)
+    const activeKey = this.activeKeyLocks.get(hash)
+    if (activeKey && activeKey.scanId !== currentScanId) {
+      return true
+    }
     for (const lane of this.lanes.values()) {
       if (lane.keyHash === hash && lane.activeScanId !== null && lane.activeScanId !== currentScanId) {
         return true
@@ -268,6 +315,8 @@ class GlobalGeminiCoordinator {
    * Called when user manually resets daily counters via Settings.
    */
   public resetAllLanes(): void {
+    this.activeKeyLocks.clear()
+    this.keyNextFreeAt.clear()
     for (const lane of this.lanes.values()) {
       lane.isExhausted = false
       delete lane.firstRpdErrorAt
@@ -446,6 +495,43 @@ class GlobalGeminiCoordinator {
           }
         }
 
+        // KEY-LEVEL EXCLUSIVE LOCK CHECK:
+        // If THIS API key is currently in use by ANY model/operation across the whole application,
+        // it MUST wait until that request completely finishes to protect TPM and RPM limits.
+        const kh = lane.keyHash
+        const activeKeyLock = this.activeKeyLocks.get(kh)
+        if (activeKeyLock) {
+          const waitMsg = `[Global Coordinator] Key ${lane.keyIdx} is currently busy with ${displayModelName(activeKeyLock.modelId)} (${activeKeyLock.operation}). Key-level lock active to protect TPM/RPM.`
+          onWait?.(waitMsg, 2)
+          setTimeout(() => {
+            if (isStopping && isStopping()) {
+              reject(new Error('Stop requested while waiting for key-level exclusive lock'))
+              return
+            }
+            void tryAcquireOrQueue()
+          }, 1000)
+          return
+        }
+
+        // KEY-LEVEL PACING BUFFER:
+        const keyNextFree = this.keyNextFreeAt.get(kh) || 0
+        if (keyNextFree > now) {
+          const waitMs = keyNextFree - now
+          const waitSec = Math.ceil(waitMs / 1000)
+          onWait?.(
+            `[Global Coordinator] Key ${lane.keyIdx} pacing buffer (${waitSec}s remaining). Pacing request...`,
+            waitSec,
+          )
+          setTimeout(() => {
+            if (isStopping && isStopping()) {
+              reject(new Error('Stop requested during key pacing buffer'))
+              return
+            }
+            void tryAcquireOrQueue()
+          }, waitMs + 20)
+          return
+        }
+
         // If lane is currently active in another scan OR there are earlier waiters queued
         const hasOtherActive = lane.activeScanId !== null
         const isQueuedBehindOthers = lane.waiters.length > 0 && lane.waiters[0]?.scanId !== scanId
@@ -526,16 +612,27 @@ class GlobalGeminiCoordinator {
 
         // Re-read lane's cooldown and global pause state before acquiring exclusively
         const checkNow = Date.now()
-        if (lane.cooldownUntil > checkNow || lane.nextFreeAt > checkNow) {
+        if (lane.cooldownUntil > checkNow || lane.nextFreeAt > checkNow || this.activeKeyLocks.has(kh)) {
           void tryAcquireOrQueue()
           return
         }
 
-        // Lock is free! Acquire exclusively now.
+        // Lock is free! Acquire exclusively now both on lane and at KEY level.
         lane.activeScanId = scanId
         lane.activeScanTitle = scanTitle
         lane.activeOperation = operation
         lane.activeSince = Date.now()
+
+        this.activeKeyLocks.set(kh, {
+          keyHash: kh,
+          keyIdx: lane.keyIdx,
+          scanId,
+          scanTitle,
+          modelId,
+          operation,
+          slot,
+          activeSince: Date.now(),
+        })
 
         const releaseFn = (actualVideoSec?: number, cooldownOverrideMs?: number) => {
           this.releaseLane(lane, actualVideoSec ?? videoSeconds, cooldownOverrideMs)
@@ -611,10 +708,13 @@ class GlobalGeminiCoordinator {
         return aUsage - bUsage
       })
 
-      // 2. Check for immediately FREE lanes (no active scan, no cooldown, no pacing wait, no waiters)
+      // 2. Check for immediately FREE lanes (no active scan, key not locked, no cooldown, no pacing wait, no waiters)
       for (const cand of sortedCandidates) {
         const lane = this.getOrCreateLane(cand.apiKey, cand.modelId, cand.slot || 0, cand.keyIdx)
+        const candKeyHash = apiKeyHash(cand.apiKey)
+        const isKeyFree = !this.activeKeyLocks.has(candKeyHash) && (this.keyNextFreeAt.get(candKeyHash) || 0) <= now
         const isFree =
+          isKeyFree &&
           lane.activeScanId === null &&
           lane.cooldownUntil <= now &&
           lane.nextFreeAt <= now &&
@@ -626,6 +726,17 @@ class GlobalGeminiCoordinator {
           lane.activeScanTitle = scanTitle
           lane.activeOperation = operation
           lane.activeSince = Date.now()
+
+          this.activeKeyLocks.set(candKeyHash, {
+            keyHash: candKeyHash,
+            keyIdx: lane.keyIdx,
+            scanId,
+            scanTitle,
+            modelId: cand.modelId,
+            operation,
+            slot: cand.slot || 0,
+            activeSince: Date.now(),
+          })
 
           const release = (actualVideoSec?: number, cooldownOverrideMs?: number) => {
             this.releaseLane(lane, actualVideoSec ?? videoSeconds, cooldownOverrideMs)
@@ -681,6 +792,11 @@ class GlobalGeminiCoordinator {
     lane.activeOperation = null
     lane.activeSince = null
 
+    // Release key-level exclusive lock
+    this.activeKeyLocks.delete(lane.keyHash)
+    // Enforce key-level minimum pacing buffer (minimum 4s spacing between consecutive requests on this key)
+    this.keyNextFreeAt.set(lane.keyHash, Math.max(this.keyNextFreeAt.get(lane.keyHash) || 0, now + 4_000))
+
     // Process next waiter in queue after pacing expires (or schedule it)
     if (lane.waiters.length > 0) {
       setTimeout(() => {
@@ -691,6 +807,13 @@ class GlobalGeminiCoordinator {
 
   private async processNext(lane: GlobalLaneState) {
     if (lane.activeScanId !== null) return // still busy
+    if (this.activeKeyLocks.has(lane.keyHash)) {
+      // Key still locked by another request, retry check after 500ms
+      setTimeout(() => {
+        void this.processNext(lane)
+      }, 500)
+      return
+    }
 
     while (lane.waiters.length > 0) {
       const next = lane.waiters.shift()
@@ -722,11 +845,32 @@ class GlobalGeminiCoordinator {
         return
       }
 
-      // Lane is free to take
+      const keyNextFree = this.keyNextFreeAt.get(lane.keyHash) || 0
+      if (keyNextFree > now) {
+        lane.waiters.unshift(next)
+        const waitMs = keyNextFree - now
+        setTimeout(() => {
+          void this.processNext(lane)
+        }, waitMs + 20)
+        return
+      }
+
+      // Lane and key are free to take!
       lane.activeScanId = next.scanId
       lane.activeScanTitle = next.scanTitle
       lane.activeOperation = next.operation
       lane.activeSince = Date.now()
+
+      this.activeKeyLocks.set(lane.keyHash, {
+        keyHash: lane.keyHash,
+        keyIdx: lane.keyIdx,
+        scanId: next.scanId,
+        scanTitle: next.scanTitle,
+        modelId: lane.modelId,
+        operation: next.operation,
+        slot: lane.slot,
+        activeSince: Date.now(),
+      })
 
       const releaseFn = (actualVideoSec?: number) => {
         this.releaseLane(lane, actualVideoSec ?? 60)
@@ -776,8 +920,10 @@ class GlobalGeminiCoordinator {
     const coolUntil = now + cooldownMs
     lane.cooldownUntil = Math.max(lane.cooldownUntil, coolUntil)
 
+    // Key-level pacing buffer: give the API key at least a 5s breather
+    this.keyNextFreeAt.set(kh, Math.max(this.keyNextFreeAt.get(kh) || 0, now + 5_000))
+
     // Cooldown only slots for THIS specific model on this API key.
-    // Each model has its own independent 250k TPM and 15 RPM quota!
     for (const other of this.lanes.values()) {
       if (other.keyHash === kh && other.modelId === modelId) {
         other.cooldownUntil = Math.max(other.cooldownUntil, coolUntil)
