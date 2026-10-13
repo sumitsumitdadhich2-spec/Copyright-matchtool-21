@@ -1,6 +1,7 @@
 import 'server-only'
 
-import { MAX_API_KEYS } from './store'
+import { MAX_API_KEYS, getApiKeyN } from './store'
+import { getUserKeyN } from './user-keys'
 import { readJSONRecord, writeJSONRecord } from './json-record'
 
 // ---------------------------------------------------------------------------
@@ -46,6 +47,7 @@ async function readNormalRecord(username: string): Promise<KeyMap> {
 /**
  * Synchronizes normal settings keys into the chat keys store if missing,
  * ensuring automatic availability without double-entry.
+ * Checks user-keys, general store settings, and process.env.
  * Returns the merged chat keys map.
  */
 export async function syncAndGetChatKeysMap(username: string): Promise<KeyMap> {
@@ -55,14 +57,25 @@ export async function syncAndGetChatKeysMap(username: string): Promise<KeyMap> {
   let changed = false
   const updated: KeyMap = { ...chatKeys }
 
-  // Auto-copy any key that exists in normal settings into chat keys
+  // Auto-copy any key that exists in user settings or general settings into chat keys
   for (let n = 1; n <= MAX_API_KEYS; n++) {
     const slotStr = String(n)
-    const normalKey = normalKeys[slotStr]
-    if (normalKey && normalKey.trim() && !updated[slotStr]) {
-      updated[slotStr] = normalKey.trim()
-      changed = true
+    if (!updated[slotStr] || !updated[slotStr].trim()) {
+      const userKey = await getUserKeyN(username, n)
+      const normalKey = normalKeys[slotStr]
+      const storeKey = getApiKeyN(n)
+      const candidateKey = (userKey || normalKey || storeKey || '').trim()
+      if (candidateKey) {
+        updated[slotStr] = candidateKey
+        changed = true
+      }
     }
+  }
+
+  // If slot 1 is still empty but environment key exists, default slot 1 to process.env.GEMINI_API_KEY
+  if (!updated['1'] && process.env.GEMINI_API_KEY?.trim()) {
+    updated['1'] = process.env.GEMINI_API_KEY.trim()
+    changed = true
   }
 
   if (changed) {
@@ -82,10 +95,17 @@ export async function forceSyncFromNormalSettings(username: string): Promise<Key
   const updated: KeyMap = { ...chatKeys }
   for (let n = 1; n <= MAX_API_KEYS; n++) {
     const slotStr = String(n)
+    const userKey = await getUserKeyN(username, n)
     const normalKey = normalKeys[slotStr]
-    if (normalKey && normalKey.trim()) {
-      updated[slotStr] = normalKey.trim()
+    const storeKey = getApiKeyN(n)
+    const candidateKey = (userKey || normalKey || storeKey || '').trim()
+    if (candidateKey) {
+      updated[slotStr] = candidateKey
     }
+  }
+
+  if (!updated['1'] && process.env.GEMINI_API_KEY?.trim()) {
+    updated['1'] = process.env.GEMINI_API_KEY.trim()
   }
 
   await writeChatRecord(username, updated)

@@ -11,6 +11,11 @@ export const runtime = 'nodejs'
 
 const ALLOWED_MODELS = [
   'gemini-3.8-flash',
+  'gemini-3.7-flash',
+  'gemini-3.6-flash',
+  'gemini-3.5-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3-flash-preview',
   'gemini-3.1-pro-preview',
   'gemini-3.1-flash-lite',
   'gemini-2.5-flash',
@@ -128,57 +133,48 @@ export async function POST(req: NextRequest) {
       const ext = path.extname(videoFile.name) || '.mp4'
       const randId = Math.random().toString(36).substring(2, 9)
       tempInputPath = path.join(os.tmpdir(), `cmt-chat-in-${Date.now()}-${randId}${ext}`)
-      tempProcessedPath = path.join(os.tmpdir(), `cmt-chat-out-${Date.now()}-${randId}.mp4`)
 
       const buffer = Buffer.from(await videoFile.arrayBuffer())
       await fs.promises.writeFile(tempInputPath, buffer)
 
-      // Video filter: timelapse speedup + fps limit + scale down for fast tokens
-      const vfParts: string[] = []
+      let uploadFilePath = tempInputPath
+
+      // Only perform FFmpeg processing if timelapse speedup factor > 1 is explicitly requested.
+      // Setting 24 fps (or any fps) does NOT re-encode the video — Gemini natively samples
+      // frames via videoMetadata: { fps } directly on Google's servers without CPU re-encode lag!
       if (timelapse > 1) {
-        // e.g. 10x timelapse => PTS divided by 10
+        tempProcessedPath = path.join(os.tmpdir(), `cmt-chat-out-${Date.now()}-${randId}.mp4`)
         const ptsFactor = (1 / timelapse).toFixed(4)
-        vfParts.push(`setpts=${ptsFactor}*PTS`)
-      }
-      vfParts.push(`fps=${fps}`)
-      vfParts.push('scale=640:-2')
-
-      const filterStr = vfParts.join(',')
-
-      try {
-        await runFfmpeg(
-          [
-            '-y',
-            '-i',
-            tempInputPath,
-            '-vf',
-            filterStr,
-            '-c:v',
-            'libx264',
-            '-preset',
-            'veryfast',
-            '-crf',
-            '28',
-            '-an',
-            '-pix_fmt',
-            'yuv420p',
-            tempProcessedPath,
-          ],
-          { label: 'chat-video-prep', owner: 'chat' },
-        )
-      } catch (ffErr) {
-        console.error('[AI Chat] FFmpeg processing error:', ffErr)
-        throw new Error(
-          `Video processing failed with requested settings (FPS: ${fps}, Timelapse: ${timelapse}x): ${
-            ffErr instanceof Error ? ffErr.message : String(ffErr)
-          }`,
-        )
+        try {
+          await runFfmpeg(
+            [
+              '-y',
+              '-i',
+              tempInputPath,
+              '-vf',
+              `setpts=${ptsFactor}*PTS`,
+              '-c:v',
+              'libx264',
+              '-preset',
+              'ultrafast',
+              '-crf',
+              '28',
+              '-an',
+              tempProcessedPath,
+            ],
+            { label: 'chat-timelapse', owner: 'chat' },
+          )
+          uploadFilePath = tempProcessedPath
+        } catch (ffErr) {
+          console.warn('[AI Chat] Timelapse speedup failed, falling back to direct video upload:', ffErr)
+          uploadFilePath = tempInputPath
+        }
       }
 
-      // Upload processed file to Gemini Files API
+      // Upload directly to Gemini Files API
       try {
         const uploadResult = await aiClient.files.upload({
-          file: tempProcessedPath,
+          file: uploadFilePath,
           mimeType: 'video/mp4',
         })
 
@@ -213,7 +209,11 @@ export async function POST(req: NextRequest) {
     // Build contents array with sanitized conversation history (alternating user/model)
     const contents: Array<{
       role: 'user' | 'model'
-      parts: Array<{ text?: string; fileData?: { fileUri: string; mimeType: string } }>
+      parts: Array<{
+        text?: string
+        fileData?: { fileUri: string; mimeType: string }
+        videoMetadata?: { fps?: number }
+      }>
     }> = []
 
     if (Array.isArray(history) && history.length > 0) {
@@ -245,12 +245,20 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const currentParts: Array<{ text?: string; fileData?: { fileUri: string; mimeType: string } }> = []
+    const currentParts: Array<{
+      text?: string
+      fileData?: { fileUri: string; mimeType: string }
+      videoMetadata?: { fps?: number }
+    }> = []
+
     if (geminiFileUri) {
       currentParts.push({
         fileData: {
           fileUri: geminiFileUri,
           mimeType: 'video/mp4',
+        },
+        videoMetadata: {
+          fps: fps, // Natively instructs Gemini to sample frames at user-requested FPS (e.g. 24 fps) without CPU re-encode!
         },
       })
     }

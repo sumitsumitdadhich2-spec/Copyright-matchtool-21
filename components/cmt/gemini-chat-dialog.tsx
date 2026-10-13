@@ -51,14 +51,18 @@ export interface ChatMessage {
 }
 
 const AVAILABLE_MODELS = [
-  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', tag: 'Recommended · Fast & Smart' },
+  { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', tag: '3.7-shiva · Fast Forensic' },
+  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', tag: '3.8-shiva · Deep Forensic (Recommended)' },
+  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', tag: '3.6-shiva · Robust Baseline' },
+  { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', tag: '3.5-shiva · High Quota' },
+  { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash Lite', tag: '3.5-shiva-lite · 500 RPD' },
   { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro', tag: 'Deep Reasoning' },
-  { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', tag: 'High Speed' },
+  { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite', tag: '3.1-shiva-lite · High Speed' },
   { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', tag: 'Multimodal' },
   { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', tag: 'Deep Multimodal' },
 ]
 
-const FPS_PRESETS = [0.5, 1, 2, 5, 24]
+const FPS_PRESETS = [24, 1, 2, 5, 0.5]
 const TIMELAPSE_PRESETS = [1, 2, 5, 10, 20, 30]
 
 interface GeminiChatDialogProps {
@@ -83,7 +87,7 @@ export function GeminiChatDialog({ open, onClose }: GeminiChatDialogProps) {
 
   // Video State
   const [attachedVideo, setAttachedVideo] = useState<File | null>(null)
-  const [fps, setFps] = useState<number>(1)
+  const [fps, setFps] = useState<number>(24)
   const [timelapse, setTimelapse] = useState<number>(1)
   const [showVideoSettings, setShowVideoSettings] = useState<boolean>(true)
 
@@ -91,6 +95,13 @@ export function GeminiChatDialog({ open, onClose }: GeminiChatDialogProps) {
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [syncingKeys, setSyncingKeys] = useState<boolean>(false)
   const [syncMsg, setSyncMsg] = useState<string | null>(null)
+
+  const lastSentRequestRef = useRef<{
+    prompt: string
+    video: File | null
+    fps: number
+    timelapse: number
+  } | null>(null)
 
   async function handleSyncKeys() {
     setSyncingKeys(true)
@@ -202,6 +213,13 @@ export function GeminiChatDialog({ open, onClose }: GeminiChatDialogProps) {
             timelapse,
           }
         : undefined,
+    }
+
+    lastSentRequestRef.current = {
+      prompt: promptToSend,
+      video: videoToSend,
+      fps,
+      timelapse,
     }
 
     setMessages((prev) => [...prev, newUserMsg])
@@ -541,7 +559,14 @@ export function GeminiChatDialog({ open, onClose }: GeminiChatDialogProps) {
                       <div className="flex flex-wrap items-center gap-2 text-xs">
                         <button
                           type="button"
-                          onClick={() => handleSend(messages[messages.length - 2]?.content)}
+                          onClick={() => {
+                            const last = lastSentRequestRef.current
+                            if (last) {
+                              void handleSend(last.prompt, last.video)
+                            } else {
+                              void handleSend(messages[messages.length - 2]?.content)
+                            }
+                          }}
                           className="flex items-center gap-1 rounded-md bg-red-600 px-3 py-1 font-semibold text-white hover:bg-red-500 transition-colors shadow"
                         >
                           <RotateCcw className="size-3" /> Retry Request
@@ -612,11 +637,11 @@ export function GeminiChatDialog({ open, onClose }: GeminiChatDialogProps) {
               <div>
                 <p className="text-xs sm:text-sm font-semibold text-amber-300">
                   {attachedVideo || messages[messages.length - 1]?.videoInfo
-                    ? `Processing video & analyzing with ${selectedModel}... (${elapsedSec}s)`
+                    ? `Uploading video & analyzing with ${selectedModel} (${fps} FPS)... (${elapsedSec}s)`
                     : `Gemini is generating response... (${elapsedSec}s)`}
                 </p>
                 <p className="text-[11px] text-zinc-400 mt-0.5">
-                  Encoding with requested FPS and timelapse settings before query.
+                  Direct upload with native Gemini videoMetadata ({fps} FPS) — zero CPU re-encode lag.
                 </p>
               </div>
             </div>
@@ -744,7 +769,7 @@ export function GeminiChatDialog({ open, onClose }: GeminiChatDialogProps) {
                   <Info className="size-3 text-amber-400 shrink-0" />
                   <span>
                     Request configuration: <strong>{fps} FPS</strong> ·{' '}
-                    <strong>{timelapse}x Timelapse</strong> (FFmpeg compresses and speeds up video accordingly before submitting to {selectedModel}).
+                    <strong>{timelapse}x Timelapse</strong> (Direct video upload with native Gemini <strong>videoMetadata: &#123; fps: {fps} &#125;</strong> sampling — no CPU re-encode).
                   </span>
                 </div>
               </div>
