@@ -2781,6 +2781,7 @@ class Scheduler {
       partial: partial || undefined,
       modelsUsed: MODEL_POOL.filter((m) => job.lanes.some((l) => getModelUsage(m.id, l.apiKey) > 0)).map((m) => m.id),
       matches: scan.matches,
+      timeoutStats: scan.timeoutStats,
       groupsTotal: groups.length,
       groupsConfirmed: groups.filter((g) => g.status === 'confirmed').length,
       groupsRejected: groups.filter((g) => g.status === 'rejected').length,
@@ -3209,6 +3210,28 @@ class Scheduler {
             if (re.kind === 'timeout' || /timed out|timeout/i.test(re.message)) {
               globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
               const timeoutSec = Math.round(CHUNK_MAP_TIMEOUT_MS / 1000)
+
+              // Count usage on the key & model because Gemini server accepted and processed the request (consuming daily quota)
+              const usedTimeout = incrementModelUsage(m.id, lane.apiKey)
+              st.usedToday = usedTimeout
+              globalGeminiCoordinator.recordUsage(lane.apiKey, m.id)
+
+              // Record timeout statistics on the scan
+              if (!scan.timeoutStats) {
+                scan.timeoutStats = {
+                  totalTimeouts: 0,
+                  byModel: {},
+                  byKey: {},
+                  wastedEstimatedTokens: 0,
+                }
+              }
+              scan.timeoutStats.totalTimeouts = (scan.timeoutStats.totalTimeouts || 0) + 1
+              scan.timeoutStats.byModel[m.id] = (scan.timeoutStats.byModel[m.id] || 0) + 1
+              scan.timeoutStats.byKey[lane.idx] = (scan.timeoutStats.byKey[lane.idx] || 0) + 1
+              scan.timeoutStats.wastedEstimatedTokens =
+                (scan.timeoutStats.wastedEstimatedTokens || 0) +
+                Math.round(totalVideoDurationSec * currentEmaRate + promptChars / 4)
+
               const errTokenUsageTimeout: ChunkTokenUsage = {
                 shortVideoTokens: Math.round(segDuration * currentEmaRate),
                 chunkVideoTokens: Math.round(movieChunkDuration * currentEmaRate),
@@ -3220,12 +3243,12 @@ class Scheduler {
                 ratePerSec: Math.round(currentEmaRate),
                 isGoogleVerified: false,
                 isError: true,
-                errorMessage: `Request Timeout: No response from Gemini API after ${timeoutSec}s`,
+                errorMessage: `Request Timeout: No response from Gemini API after ${timeoutSec}s (Counted against quota: ${usedTimeout} used today)`,
               }
               this.recordChunkOutput(
                 chunk,
                 m.id,
-                `[REQUEST TIMEOUT DIAGNOSTIC]\nModel: ${m.id} (Key ${lane.idx})\nTimeout Limit: ${timeoutSec}s\nEstimated Input Tokens: ~${Math.round(totalVideoDurationSec * currentEmaRate + promptChars / 4).toLocaleString()} (Short: ${Math.round(segDuration * currentEmaRate).toLocaleString()}tok, Chunk: ${Math.round(movieChunkDuration * currentEmaRate).toLocaleString()}tok, Prompt: ${Math.round(promptChars / 4)}tok)\nStatus: Gemini API did not complete response within ${timeoutSec}s\nAction: Aborting and switching to next model\nError: ${reqErr instanceof Error ? reqErr.message : String(reqErr)}\nTimestamp: ${new Date().toISOString()}`,
+                `[REQUEST TIMEOUT DIAGNOSTIC]\nModel: ${m.id} (Key ${lane.idx})\nTimeout Limit: ${timeoutSec}s\nEstimated Input Tokens: ~${Math.round(totalVideoDurationSec * currentEmaRate + promptChars / 4).toLocaleString()} (Short: ${Math.round(segDuration * currentEmaRate).toLocaleString()}tok, Chunk: ${Math.round(movieChunkDuration * currentEmaRate).toLocaleString()}tok, Prompt: ${Math.round(promptChars / 4)}tok)\nStatus: Gemini API did not complete response within ${timeoutSec}s (Counted on key ${lane.idx}: ${usedTimeout} used today)\nAction: Aborting and switching to next model\nError: ${reqErr instanceof Error ? reqErr.message : String(reqErr)}\nTimestamp: ${new Date().toISOString()}`,
                 errTokenUsageTimeout,
                 'error',
                 reqErr instanceof Error ? reqErr.message : String(reqErr),
@@ -3233,7 +3256,7 @@ class Scheduler {
               addLog(
                 scan,
                 'warn',
-                `${minutePrefix}Chunk ${chunkIndex}: ${displayModelName(m.id)} (key ${lane.idx}) timed out after ${timeoutSec}s (est. input: ~${estimatedTokens.toLocaleString()} tokens) — aborting request and switching to next model!`,
+                `${minutePrefix}Chunk ${chunkIndex}: ${displayModelName(m.id)} (key ${lane.idx}) timed out after ${timeoutSec}s (est. input: ~${estimatedTokens.toLocaleString()} tokens) — request counted against quota (${usedTimeout} used today); aborting and switching to next model!`,
               )
               // Put this model lane on 1-min cooldown so other models or keys pick up this chunk
               job.cooldownUntil[rk] = Date.now() + 60_000
@@ -3676,7 +3699,7 @@ class Scheduler {
             const ms = laneState.models.find((item) => item.id === m.id)
             if (ms) ms.state = 'cooling'
           }
-          addLog(scan, 'warn', `${m.id} (key ${lane.idx}): Request timed out after 3 minutes without response — Chunk ${chunkIndex} re-queued for next model/lane.`)
+          addLog(scan, 'warn', `${m.id} (key ${lane.idx}): Request timed out after 10 minutes without response — Chunk ${chunkIndex} re-queued for next model/lane.`)
           this.requeueFailedChunk(job, chunkIndex, m.id, lane.idx, 'Request timeout', minutePrefix)
         } else if (e.kind === 'empty') {
           addLog(scan, 'warn', `${minutePrefix}Chunk ${chunkIndex}: empty response on ${m.id} (key ${lane.idx}) — diagnostic saved in AI Output; chunk safely re-queued for another worker`)

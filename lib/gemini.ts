@@ -3,6 +3,21 @@ import path from 'path'
 import { GoogleGenAI, ThinkingLevel, HarmCategory, HarmBlockThreshold } from '@google/genai'
 import { SCAN_FPS, MAX_OUTPUT_TOKENS } from './models'
 import type { ChunkMatch } from './types'
+import { setGlobalDispatcher, Agent } from 'undici'
+
+// Configure global fetch dispatcher with 15-minute timeouts to support 10-minute Gemini requests
+// and eliminate Node.js fetch 'Headers Timeout Error' (which defaults to 5 minutes)
+try {
+  setGlobalDispatcher(
+    new Agent({
+      headersTimeout: 15 * 60 * 1000,
+      bodyTimeout: 15 * 60 * 1000,
+      connectTimeout: 60 * 1000,
+    }),
+  )
+} catch {
+  // ignore in non-Node or restricted environments
+}
 
 /** Shared generation config for EVERY request:
  * thinking level HIGH + max output tokens + BLOCK_NONE safety thresholds to prevent false safety blocks. */
@@ -1643,7 +1658,7 @@ export interface MapChunkResult {
   elapsedMs: number
 }
 
-export const CHUNK_MAP_TIMEOUT_MS = 360_000 // 6 minutes safety timeout for large video chunks (~160k-200k tokens generating up to 4k+ tokens)
+export const CHUNK_MAP_TIMEOUT_MS = 600_000 // 10 minutes safety timeout for large video chunks (~160k-250k tokens generating up to 4k+ tokens)
 
 /** One chunk-map request: whole short video + one movie chunk, the SAME prompt every time.
  * Returns the raw model text (HISSA 1 + HISSA 2) along with usageMetadata and execution timing. */

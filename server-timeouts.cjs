@@ -19,3 +19,17 @@ http.createServer = function createServerWithUploadTimeouts(...args) {
   server.keepAliveTimeout = 65_000 // keep-alive idle > Caddy's dial/idle defaults
   return server
 }
+
+// Configure undici dispatcher for outbound Gemini fetch calls (15 min timeouts)
+try {
+  const { setGlobalDispatcher, Agent } = require('undici')
+  setGlobalDispatcher(
+    new Agent({
+      headersTimeout: 15 * 60 * 1000,
+      bodyTimeout: 15 * 60 * 1000,
+      connectTimeout: 60 * 1000,
+    }),
+  )
+} catch {
+  // ignore
+}

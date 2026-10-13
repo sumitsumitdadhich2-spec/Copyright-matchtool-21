@@ -761,6 +761,13 @@ export interface KeyLaneLiveState {
   models: KeyLaneModelLiveState[]
 }
 
+export interface TimeoutStats {
+  totalTimeouts: number
+  byModel: Record<string, number>
+  byKey: Record<number, number>
+  wastedEstimatedTokens: number
+}
+
 export interface ScanReport {
   totalScanTimeMs: number
   chunksScanned: number
@@ -772,6 +779,8 @@ export interface ScanReport {
   modelsUsed: string[]
   /** all parsed matches across all chunks (absolute movie seconds) */
   matches: ChunkMatch[]
+  /** Timeout and wasted request stats */
+  timeoutStats?: TimeoutStats
   /** verifier pipeline stats (present when the verification phase ran) */
   groupsTotal?: number
   groupsConfirmed?: number
@@ -873,6 +882,7 @@ export interface Scan {
   finishedAt: number | null
   error: string | null
   report: ScanReport | null
+  timeoutStats?: TimeoutStats
   modelStates: Record<string, ModelLiveState>
   keyLanes?: KeyLaneLiveState[]
 }

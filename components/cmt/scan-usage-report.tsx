@@ -15,6 +15,7 @@ import {
   XCircle,
   ShieldCheck,
   ShieldAlert,
+  Clock,
 } from 'lucide-react'
 import type { Scan } from '@/lib/types'
 import { computeScanUsage } from '@/lib/scan-usage'
@@ -65,6 +66,12 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
             <ShieldCheck className="size-3.5" />
             <span>Effective (Kaam Hua): {effectiveRequests} req</span>
           </div>
+          {usage.totalTimeouts > 0 && (
+            <div className="flex items-center gap-1.5 rounded-full border border-red-500/40 bg-red-500/10 px-3 py-1 text-xs font-bold text-red-400">
+              <Clock className="size-3.5" />
+              <span>Timeouts (Wasted): {usage.totalTimeouts} req</span>
+            </div>
+          )}
           {errorBreakdown.prohibitedPolicy > 0 && (
             <div className="flex items-center gap-1.5 rounded-full border border-purple-500/30 bg-purple-500/10 px-3 py-1 text-xs font-semibold text-purple-400">
               <ShieldAlert className="size-3.5" />
@@ -74,14 +81,14 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
           {totalErrors > 0 && (
             <div className="flex items-center gap-1.5 rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-1 text-xs font-semibold text-amber-400">
               <AlertTriangle className="size-3.5" />
-              <span>Errors (No Token Cost): {totalErrors}</span>
+              <span>Errors (Auto-retried): {totalErrors}</span>
             </div>
           )}
         </div>
       </div>
 
-      {/* Top 4 Metric Cards: Real Work vs Policy Handled vs High Demand/429 vs 404 */}
-      <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      {/* Top Metric Cards: Real Work vs Timeouts vs Policy Handled vs High Demand/429 vs 404 */}
+      <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
         {/* Effective Real Work */}
         <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-3.5 shadow-sm">
           <div className="flex items-center justify-between">
@@ -103,11 +110,32 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
           </p>
         </div>
 
+        {/* Timeouts (Wasted Requests) */}
+        <div className={`rounded-xl border p-3.5 shadow-sm ${usage.totalTimeouts > 0 ? 'border-red-500/40 bg-red-950/25' : 'border-border bg-muted/30'}`}>
+          <div className="flex items-center justify-between">
+            <span className={`text-xs font-bold uppercase tracking-wider ${usage.totalTimeouts > 0 ? 'text-red-400' : 'text-muted-foreground'}`}>
+              Timeouts (Wasted Req)
+            </span>
+            <span className="flex size-6 items-center justify-center rounded-full bg-red-500/20 text-red-300">
+              <Clock className="size-3.5" />
+            </span>
+          </div>
+          <div className="mt-2 flex items-baseline gap-2">
+            <span className={`font-mono text-2xl font-bold ${usage.totalTimeouts > 0 ? 'text-red-400' : 'text-muted-foreground'}`}>
+              {usage.totalTimeouts}
+            </span>
+            <span className="text-xs text-muted-foreground">timed out</span>
+          </div>
+          <p className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
+            Google server ne request accept karke quota count kiya, par client ne timeout par abort kiya.
+          </p>
+        </div>
+
         {/* Prohibited Policy Handled & Retried */}
         <div className="rounded-xl border border-purple-500/30 bg-purple-500/10 p-3.5 shadow-sm">
           <div className="flex items-center justify-between">
             <span className="text-xs font-bold uppercase tracking-wider text-purple-400">
-              Policy Handled & Retried
+              Policy Handled
             </span>
             <span className="flex size-6 items-center justify-center rounded-full bg-purple-500/20 text-purple-300">
               <ShieldAlert className="size-3.5" />
@@ -117,10 +145,10 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
             <span className="font-mono text-2xl font-bold text-purple-400">
               {errorBreakdown.prohibitedPolicy}
             </span>
-            <span className="text-xs font-medium text-purple-300/80">policy requests (incl. retry)</span>
+            <span className="text-xs font-medium text-purple-300/80">policy requests</span>
           </div>
           <p className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
-            Google policy par 1 audio-strip sanitized retry hua. Quota bachaane ke liye 1 baar ke baad turant stop hua.
+            Google policy par audio-strip sanitized retry hua; quota bachane ke liye safely limit hua.
           </p>
         </div>
 
@@ -128,7 +156,7 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
         <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5 shadow-sm">
           <div className="flex items-center justify-between">
             <span className="text-xs font-bold uppercase tracking-wider text-amber-400">
-              High Demand / 429 / Empty
+              High Demand / 429
             </span>
             <span className="flex size-6 items-center justify-center rounded-full bg-amber-500/20 text-amber-300">
               <AlertTriangle className="size-3.5" />
@@ -138,10 +166,10 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
             <span className="font-mono text-2xl font-bold text-amber-400">
               {errorBreakdown.highDemandOrRateLimit}
             </span>
-            <span className="text-xs font-medium text-amber-300/80">auto-retried attempts</span>
+            <span className="text-xs font-medium text-amber-300/80">auto-retried</span>
           </div>
           <p className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
-            Google server 503 load / temporary 429 rate limit. <strong className="text-foreground">Isse API key se koi token cut nahi hota</strong>.
+            Google 503 load / temporary 429 rate limit. <strong className="text-foreground">Isse API key se koi token cut nahi hota</strong>.
           </p>
         </div>
 
@@ -149,7 +177,7 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
         <div className="rounded-xl border border-border bg-muted/40 p-3.5 shadow-sm">
           <div className="flex items-center justify-between">
             <span className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
-              404 & Daily Limit Reached
+              404 &amp; Daily Cap
             </span>
             <span className="flex size-6 items-center justify-center rounded-full bg-muted text-muted-foreground">
               <XCircle className="size-3.5" />
@@ -159,13 +187,61 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
             <span className="font-mono text-2xl font-bold text-foreground">
               {errorBreakdown.notFound404 + errorBreakdown.dailyExhausted + errorBreakdown.invalidKey}
             </span>
-            <span className="text-xs text-muted-foreground">stopped/retired</span>
+            <span className="text-xs text-muted-foreground">stopped</span>
           </div>
           <p className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground">
             Model 25M daily limit ({errorBreakdown.dailyExhausted}) ya 404 unavailable ({errorBreakdown.notFound404}).
           </p>
         </div>
       </div>
+
+      {/* Timeouts Diagnostic Breakdown Banner (if timeouts occurred) */}
+      {usage.totalTimeouts > 0 && (
+        <div className="mt-3 rounded-xl border border-red-500/40 bg-red-950/30 p-3.5 text-xs text-red-200 shadow-md">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-red-900/50 pb-2 mb-2">
+            <div className="flex items-center gap-2">
+              <Clock className="size-4 text-red-400 shrink-0" />
+              <span className="font-bold text-red-300">
+                Timeouts Diagnostic: {usage.totalTimeouts} Wasted Request(s) Detected
+              </span>
+            </div>
+            <span className="rounded-full bg-red-900/60 border border-red-700/50 px-2.5 py-0.5 text-[10px] font-mono text-red-200">
+              Timeout Setting: Ab 10 Minutes (600s) Active
+            </span>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-2">
+            <div className="rounded-lg bg-black/40 p-2.5 border border-red-900/40">
+              <span className="text-[10px] uppercase font-bold text-zinc-400 block mb-1">
+                Wasted Requests by Model:
+              </span>
+              <div className="space-y-1">
+                {Object.entries(usage.timeoutsByModel).map(([mId, cnt]) => (
+                  <div key={mId} className="flex justify-between font-mono text-xs">
+                    <span className="text-zinc-200 font-sans font-medium">{displayModelName(mId)}</span>
+                    <span className="font-bold text-red-400">{cnt} timeout(s)</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-lg bg-black/40 p-2.5 border border-red-900/40">
+              <span className="text-[10px] uppercase font-bold text-zinc-400 block mb-1">
+                Timeouts by API Key:
+              </span>
+              <div className="space-y-1">
+                {Object.entries(usage.timeoutsByKey).map(([kIdx, cnt]) => (
+                  <div key={kIdx} className="flex justify-between font-mono text-xs">
+                    <span className="text-zinc-200 font-sans font-medium">Key {kIdx}</span>
+                    <span className="font-bold text-amber-400">{cnt} timeout(s)</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+          <p className="mt-2 text-[11px] text-zinc-400">
+            * Note: Jab request timeout hoti hai to Google quota deduct kar chuka hota hai. System ab in timeouts ko key aur model par count karta hai aur timeout limit badhakar 10 minute kar di gayi hai taaki aage koi request waste na ho.
+          </p>
+        </div>
+      )}
 
       {/* Google API Billing Rules & Transparency Accordion */}
       <div className="mt-3 rounded-lg border border-primary/20 bg-primary/5 p-3">
@@ -305,6 +381,7 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
               <tr className="border-b border-border/80 bg-muted/60 text-muted-foreground font-medium">
                 <th className="px-3 py-2">Model</th>
                 <th className="px-2 py-2 text-center text-emerald-400">Effective (Kaam Hua)</th>
+                <th className="px-2 py-2 text-center text-red-400">Timeouts (Wasted)</th>
                 <th className="px-2 py-2 text-center text-purple-400">Policy Blocked &amp; Retried</th>
                 <th className="px-2 py-2 text-center text-amber-400">High Demand / 429</th>
                 <th className="px-2 py-2 text-center text-muted-foreground">404 / Limits</th>
@@ -337,6 +414,9 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
                     <td className="px-2 py-2 text-center font-bold text-emerald-400 bg-emerald-500/5">
                       {data.effective || '0'}
                     </td>
+                    <td className="px-2 py-2 text-center font-bold text-red-400 bg-red-500/5">
+                      {data.timeouts || '—'}
+                    </td>
                     <td className="px-2 py-2 text-center font-medium text-purple-400 bg-purple-500/5">
                       {data.errors.prohibitedPolicy || '—'}
                     </td>
@@ -360,6 +440,9 @@ export function ScanUsageReport({ scan }: { scan: Scan }) {
                 <td className="px-3 py-2">Grand Total</td>
                 <td className="px-2 py-2 text-center font-mono text-emerald-400 font-bold bg-emerald-500/10">
                   {effectiveRequests}
+                </td>
+                <td className="px-2 py-2 text-center font-mono text-red-400 font-bold bg-red-500/10">
+                  {usage.totalTimeouts}
                 </td>
                 <td className="px-2 py-2 text-center font-mono text-purple-400 font-bold bg-purple-500/10">
                   {errorBreakdown.prohibitedPolicy || '0'}

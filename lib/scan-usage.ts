@@ -2,6 +2,7 @@ import type { Scan } from './types'
 
 export interface ErrorCountDetails {
   highDemandOrRateLimit: number // 503 / 429 / Empty Response / Server Busy (No tokens billed)
+  timeout: number // Client aborted after timeout (Google received request and counted quota — wasted request)
   notFound404: number // 404 model / clip not found (No tokens billed)
   invalidKey: number // Invalid / expired key (No tokens billed)
   dailyExhausted: number // Daily 25M token or 20 RPD cap reached
@@ -17,6 +18,7 @@ export interface ModelUsageCategory {
   missingScene: number
   total: number // Total attempts made
   effective: number // Completed successful requests (Actual tokens/quota consumed)
+  timeouts: number // Timeouts occurred on this model (Request sent to Google but aborted)
   errors: ErrorCountDetails
 }
 
@@ -24,6 +26,10 @@ export interface ScanUsageSummary {
   totalRequests: number // Total attempts made across all models
   effectiveRequests: number // Vastav me safal requests (Token quota deduct hua)
   totalErrors: number // Total failed/retried attempts (No token quota charged)
+  totalTimeouts: number // Total requests that timed out (Wasted requests)
+  wastedEstimatedTokens: number // Estimated wasted tokens due to timeouts
+  timeoutsByModel: Record<string, number> // Timeout counts per model
+  timeoutsByKey: Record<number, number> // Timeout counts per key
   errorBreakdown: ErrorCountDetails
   byModel: Record<string, ModelUsageCategory>
   byStage: {
@@ -50,8 +56,13 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
     totalRequests: 0,
     effectiveRequests: 0,
     totalErrors: 0,
+    totalTimeouts: 0,
+    wastedEstimatedTokens: 0,
+    timeoutsByModel: {},
+    timeoutsByKey: {},
     errorBreakdown: {
       highDemandOrRateLimit: 0,
+      timeout: 0,
       notFound404: 0,
       invalidKey: 0,
       dailyExhausted: 0,
@@ -87,8 +98,10 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
         missingScene: 0,
         total: 0,
         effective: 0,
+        timeouts: 0,
         errors: {
           highDemandOrRateLimit: 0,
+          timeout: 0,
           notFound404: 0,
           invalidKey: 0,
           dailyExhausted: 0,
@@ -133,6 +146,12 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
       const errKey = errorType || 'highDemandOrRateLimit'
       bucket.errors[errKey] += 1
       summary.errorBreakdown[errKey] += 1
+
+      if (errKey === 'timeout') {
+        bucket.timeouts = (bucket.timeouts || 0) + 1
+        summary.totalTimeouts += 1
+        summary.timeoutsByModel[cleanId] = (summary.timeoutsByModel[cleanId] || 0) + 1
+      }
     }
   }
 
@@ -151,6 +170,13 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
       let errorCategory: keyof ErrorCountDetails = 'highDemandOrRateLimit'
 
       if (
+        lower.includes('timed out') ||
+        lower.includes('timeout') ||
+        lower.includes('headers timeout')
+      ) {
+        isError = true
+        errorCategory = 'timeout'
+      } else if (
         lower.includes('prohibited') ||
         lower.includes('policy') ||
         lower.includes('safety_ratings_blocked') ||
@@ -215,6 +241,18 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
         const defaultModelForStage =
           stage === 'verifier' ? 'gemini-3.5-flash-lite' : stage === 'rescan' ? 'gemini-3-flash-preview' : 'gemini-3.7-flash'
         const rawModel = normalizeModelName(modelMatch ? modelMatch[1] : defaultModelForStage)
+
+        if (errorCategory === 'timeout') {
+          const keyMatch = msg.match(/key\s+(\d+)/i)
+          if (keyMatch) {
+            const kIdx = parseInt(keyMatch[1], 10)
+            summary.timeoutsByKey[kIdx] = (summary.timeoutsByKey[kIdx] || 0) + 1
+          }
+          const tokensMatch = msg.match(/~(\d[\d,]*)\s*tokens/i)
+          if (tokensMatch) {
+            summary.wastedEstimatedTokens += parseInt(tokensMatch[1].replace(/,/g, ''), 10)
+          }
+        }
 
         // Differentiate retry vs initial policy hits so they are never deduped away
         const isRetryPolicy = lower.includes('after sanitized retry')
@@ -407,10 +445,20 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
     }
   }
 
-  // Ensure default models exist in summary
-  const defaultModels = ['gemini-3.7-flash', 'gemini-3.8-flash', 'gemini-3.6-flash']
-  for (const m of defaultModels) {
-    getModelBucket(m)
+  // Merge structured timeout stats if available
+  const tStats = scan.timeoutStats || scan.report?.timeoutStats
+  if (tStats) {
+    summary.totalTimeouts = Math.max(summary.totalTimeouts, tStats.totalTimeouts || 0)
+    summary.wastedEstimatedTokens = Math.max(summary.wastedEstimatedTokens, tStats.wastedEstimatedTokens || 0)
+    for (const [mId, cnt] of Object.entries(tStats.byModel || {})) {
+      const clean = normalizeModelName(mId)
+      summary.timeoutsByModel[clean] = Math.max(summary.timeoutsByModel[clean] || 0, cnt)
+      const b = getModelBucket(clean)
+      b.timeouts = Math.max(b.timeouts || 0, cnt)
+    }
+    for (const [kIdx, cnt] of Object.entries(tStats.byKey || {})) {
+      summary.timeoutsByKey[Number(kIdx)] = Math.max(summary.timeoutsByKey[Number(kIdx)] || 0, cnt)
+    }
   }
 
   return summary
