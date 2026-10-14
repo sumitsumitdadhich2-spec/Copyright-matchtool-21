@@ -1127,6 +1127,10 @@ async function laneWorker(
         incrementModelUsage(lane.model.id, lane.apiKey)
       } catch (reqErr) {
         const re = classifyError(reqErr)
+        // Count 503 high demand error as 1 request on key & model quota
+        if (re.kind === 'overloaded' || re.httpStatus === 503) {
+          incrementModelUsage(lane.model.id, lane.apiKey)
+        }
         const isPolicyBlocked =
           re.kind === 'policy_blocked' ||
           /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(re.message)
@@ -1156,6 +1160,10 @@ async function laneWorker(
               `${tag} #${w.index}: Sanitized retry succeeded after policy flag bypass (${sendResult.parsed.hits.length} hit(s)) on ${lane.label}`,
             )
           } catch (retryErr) {
+            const retryRe = classifyError(retryErr)
+            if (retryRe.kind === 'overloaded' || retryRe.httpStatus === 503) {
+              incrementModelUsage(lane.model.id, lane.apiKey)
+            }
             throw retryErr
           }
         } else {

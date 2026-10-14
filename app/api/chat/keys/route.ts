@@ -10,11 +10,6 @@ import { MAX_API_KEYS } from '@/lib/store'
 
 export const runtime = 'nodejs'
 
-function mask(key: string) {
-  if (key.length <= 10) return `${key.slice(0, 3)}...`
-  return `${key.slice(0, 6)}...${key.slice(-4)}`
-}
-
 export async function GET() {
   const session = await getSession()
   if (!session) {
@@ -29,8 +24,8 @@ export async function GET() {
     if (key && key.trim()) {
       configuredSlots.push({
         slot: n,
-        label: `Chat Key ${n} (${mask(key.trim())})`,
-        maskedKey: mask(key.trim()),
+        label: `Key ${n}`,
+        maskedKey: `Key ${n}`,
       })
     }
   }

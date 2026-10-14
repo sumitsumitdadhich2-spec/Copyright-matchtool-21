@@ -472,9 +472,12 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
               queue.push(item)
               log(scan, 'warn', `Missing-scene finder: Empty response on ${lane.model.id} (key ${lane.keyIndex + 1}) [No quota cut] — chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued for alternative model`)
             } else if (e.kind === 'rate' || is503OrBusyError(err)) {
+              if (is503OrBusyError(err) || e.kind === 'overloaded') {
+                incrementModelUsage(lane.model.id, lane.key)
+              }
               lane.cooldownUntil = Date.now() + 5_000
               queue.push(item)
-              log(scan, 'warn', `Missing-scene finder: Rate limit / High demand on ${lane.model.id} (key ${lane.keyIndex + 1}) [No quota cut] — chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued (cooldown 5s)`)
+              log(scan, 'warn', `Missing-scene finder: Rate limit / High demand (503) on ${lane.model.id} (key ${lane.keyIndex + 1}) — chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued (cooldown 5s)`)
             } else {
               queue.push(item)
               log(scan, 'warn', `Missing-scene finder: Chunk ${chunkIndex + 1} attempt ${item.attempts}/7 failed on ${lane.model.id} (key ${lane.keyIndex + 1}) [${e.message.slice(0, 100)}] — auto-retrying on another lane...`)

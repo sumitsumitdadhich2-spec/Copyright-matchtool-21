@@ -86,6 +86,9 @@ export const MODEL_POOL: ModelSpec[] = [
   ...RESCAN_MODEL_POOL,
   ...RESCAN_BACKUP_POOL,
   ...PADDED_VERIFY_MODEL_POOL,
+  { id: 'gemini-2.5-flash', rpm: 5, rpd: 20 },
+  { id: 'gemini-2.5-pro', rpm: 5, rpd: 20 },
+  { id: 'gemini-3.1-pro-preview', rpm: 5, rpd: 20 },
 ].filter((m, i, arr) => arr.findIndex((x) => x.id === m.id) === i)
 
 /** Is this model one of the three locked chunk-map models? */

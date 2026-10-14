@@ -147,6 +147,22 @@ export function computeScanUsage(scan: Scan | null | undefined): ScanUsageSummar
       bucket.errors[errKey] += 1
       summary.errorBreakdown[errKey] += 1
 
+      // User instruction: Count 503 high demand errors as 1 request on this key & model quota
+      if (errKey === 'highDemandOrRateLimit') {
+        bucket.effective += 1
+        summary.effectiveRequests += 1
+        summary.byStage[stage] += 1
+        if (cleanId.includes('3.7')) {
+          summary.mainModels.gemini37 += 1
+        } else if (cleanId.includes('3.8')) {
+          summary.mainModels.gemini38 += 1
+        } else if (cleanId.includes('3.6')) {
+          summary.mainModels.gemini36 += 1
+        } else {
+          summary.mainModels.others += 1
+        }
+      }
+
       if (errKey === 'timeout') {
         bucket.timeouts = (bucket.timeouts || 0) + 1
         summary.totalTimeouts += 1

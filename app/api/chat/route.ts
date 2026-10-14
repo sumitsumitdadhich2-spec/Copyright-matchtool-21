@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { GoogleGenAI } from '@google/genai'
 import { getSession } from '@/lib/users'
 import { getChatKeyN, getAllChatApiKeys } from '@/lib/chat-keys'
+import { incrementModelUsage } from '@/lib/store'
 import { runFfmpeg } from '@/lib/ffmpeg-pool'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -271,6 +272,10 @@ export async function POST(req: NextRequest) {
       parts: currentParts,
     })
 
+    const requestSentAt = Date.now()
+    // User instruction: Every request made in AI chat must count toward settings quota for that key and model!
+    const usedToday = incrementModelUsage(model, resolvedApiKey)
+
     const response = await aiClient.models.generateContent({
       model,
       contents,
@@ -280,11 +285,18 @@ export async function POST(req: NextRequest) {
       },
     })
 
+    const requestRespondedAt = Date.now()
     const responseText = response.text || ''
 
     return NextResponse.json({
       reply: responseText,
       model,
+      keySlot: keySlot || 1,
+      keyUsed: keySlot ? `Key ${keySlot}` : 'Key 1',
+      usedToday,
+      sentAt: requestSentAt,
+      respondedAt: requestRespondedAt,
+      durationMs: requestRespondedAt - requestSentAt,
       fps: videoFile ? fps : undefined,
       timelapse: videoFile ? timelapse : undefined,
       hadVideo: Boolean(videoFile),
@@ -293,9 +305,21 @@ export async function POST(req: NextRequest) {
   } catch (err: unknown) {
     console.error('[AI Chat] Request failed:', err)
     const errorMsg = err instanceof Error ? err.message : String(err)
+    const lower = errorMsg.toLowerCase()
+    const is503 = lower.includes('503') || lower.includes('high demand') || lower.includes('unavailable')
+    const is429 = lower.includes('429') || lower.includes('quota') || lower.includes('rate limit')
+    const now = Date.now()
     return NextResponse.json(
       {
         error: errorMsg,
+        is503,
+        is429,
+        model: typeof model === 'string' ? model : 'gemini-3.8-flash',
+        keySlot: keySlot || 1,
+        keyUsed: keySlot ? `Key ${keySlot}` : 'Key 1',
+        sentAt: typeof requestSentAt === 'number' ? requestSentAt : now,
+        respondedAt: now,
+        durationMs: typeof requestSentAt === 'number' ? now - requestSentAt : 0,
       },
       { status: 400 },
     )

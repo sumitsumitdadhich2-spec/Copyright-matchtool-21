@@ -260,7 +260,7 @@ export function ApiKeyPanel() {
               {slot.hasKey ? (
                 <span className="ml-auto flex items-center gap-1 rounded-full bg-success/15 px-2 py-0.5 font-mono text-xs text-success">
                   <Check className="size-3" aria-hidden />
-                  {slot.maskedKey}
+                  Key {n} Active
                 </span>
               ) : n === 1 ? (
                 <span className="ml-auto rounded-full bg-destructive/15 px-2 py-0.5 text-xs text-destructive">not set</span>
@@ -384,7 +384,7 @@ export function ApiKeyPanel() {
           {data?.twelveLabs?.hasKey ? (
             <span className="ml-auto flex items-center gap-1 rounded-full bg-success/15 px-2 py-0.5 font-mono text-xs text-success">
               <Check className="size-3" aria-hidden />
-              {data.twelveLabs.maskedKey}
+              Twelve Labs Active
             </span>
           ) : (
             <span className="ml-auto rounded-full bg-secondary px-2 py-0.5 text-xs text-muted-foreground">not set</span>

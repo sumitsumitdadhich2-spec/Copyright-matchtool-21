@@ -23,10 +23,6 @@ import { getKeyStorageInfo, deleteAllFilesOnKey } from '@/lib/gemini'
 
 export const runtime = 'nodejs'
 
-function mask(key: string) {
-  return `${key.slice(0, 6)}...${key.slice(-4)}`
-}
-
 export async function GET() {
   const session = await getSession()
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
@@ -84,7 +80,7 @@ export async function GET() {
     keys.push({
       index: n,
       hasKey: Boolean(k),
-      maskedKey: k ? mask(k) : null,
+      maskedKey: k ? `Key ${n} Configured` : null,
       usage,
       exhausted,
       totalRequests,
@@ -106,7 +102,7 @@ export async function GET() {
     // Minute finder toggle: 'gemini' (default) | 'twelvelabs' | 'off'
     minuteFinder,
     // OPTIONAL Twelve Labs pre-filter key (missing = feature off, app unchanged)
-    twelveLabs: { hasKey: Boolean(tlKey), maskedKey: tlKey ? mask(tlKey) : null },
+    twelveLabs: { hasKey: Boolean(tlKey), maskedKey: tlKey ? 'Twelve Labs Configured' : null },
     // legacy fields kept for older clients
     hasKey: keys[0].hasKey,
     maskedKey: keys[0].maskedKey,

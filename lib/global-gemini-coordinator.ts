@@ -375,10 +375,9 @@ class GlobalGeminiCoordinator {
     this.checkDayRollover()
     const lane = this.getOrCreateLane(apiKey, modelId, slot, keyIdx)
 
-    // Pre-flight quota check: if daily quota is already exhausted, abort immediately without waiting or uploading!
+    // Per user rule: Do NOT block models when RPD is reached — allow request to proceed anyway!
     if (this.isModelExhausted(apiKey, modelId, rpd)) {
       lane.isExhausted = true
-      throw new Error(`[Global Coordinator] Key ${keyIdx} (${modelId}) daily quota (${rpd} RPD) is exhausted for today. Skipping immediately.`)
     }
 
     return new Promise<(actualVideoSec?: number, cooldownOverrideMs?: number) => void>((resolve, reject) => {
@@ -390,8 +389,6 @@ class GlobalGeminiCoordinator {
 
         if (this.isModelExhausted(apiKey, modelId, rpd)) {
           lane.isExhausted = true
-          reject(new Error(`[Global Coordinator] Key ${keyIdx} (${modelId}) daily quota (${rpd} RPD) is exhausted for today. Skipping immediately.`))
-          return
         }
 
         const now = Date.now()
@@ -690,14 +687,12 @@ class GlobalGeminiCoordinator {
 
       this.checkDayRollover()
 
-      // 1. Filter out permanently exhausted / disabled lanes and persist exhausted state instantly
-      const availableCandidates = candidates.filter((c) => {
+      // 1. Prioritize non-exhausted candidates, but if all reached quota, keep all candidates eligible
+      // per user rule: "rpd khtm hone pr un model ko block mat krna req fir bhi kr ske"
+      const nonExhausted = candidates.filter((c) => {
         return !this.isModelExhausted(c.apiKey, c.modelId, c.rpd || 500)
       })
-
-      if (availableCandidates.length === 0) {
-        throw new Error('All candidate keys/models have reached their daily quota or are exhausted')
-      }
+      const availableCandidates = nonExhausted.length > 0 ? nonExhausted : candidates
 
       // Sort candidates to prioritize same-key multi-model usage before switching keys:
       // Group by keyIdx ascending, and test available models on the current key first

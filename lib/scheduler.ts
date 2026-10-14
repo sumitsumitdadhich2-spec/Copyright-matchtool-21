@@ -1941,7 +1941,7 @@ class Scheduler {
     isVerify: boolean = false,
     verifyLockId?: string,
   ): Promise<T> {
-    if (getModelUsage(m.id, lane.apiKey) >= m.rpd) throw new GeminiError('rpd', `${m.id} daily cap reached`)
+    // User rule: Do not block models even if RPD is reached ("rpd khtm hone pr un model ko block mat krna req fir bhi kr ske")
     const pk = this.paceSlotKey(lane, m, slot)
     const rk = this.rateKey(lane, m)
     const st = this.modelState(job, lane, m)
@@ -3266,6 +3266,8 @@ class Scheduler {
               throw reqErr
             } else if (re.kind === 'overloaded') {
               overloadedRetries++
+              // Count each 503 high-demand attempt against this key & model quota
+              incrementModelUsage(m.id, lane.apiKey)
               if (overloadedRetries <= maxOverloadedRetries) {
                 const baseDelay = overloadedDelays[overloadedRetries - 1]
                 const jitterMs = Math.round(Math.random() * 2000)
@@ -3645,6 +3647,8 @@ class Scheduler {
           this.requeueFailedChunk(job, chunkIndex, m.id, lane.idx, 'API key invalid/expired', minutePrefix)
           addLog(scan, 'error', `API Key ${lane.idx} is invalid/expired — disabled for this scan; Chunk ${chunkIndex} re-queued for another key`)
         } else if (e.kind === 'overloaded') {
+          // Count 503 attempt against this model & key quota
+          incrementModelUsage(m.id, lane.apiKey)
           const quotaOutcome = globalGeminiCoordinator.handleQuotaOrRateError(
             lane.apiKey,
             m.id,
