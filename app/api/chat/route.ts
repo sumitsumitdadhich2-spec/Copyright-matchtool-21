@@ -38,14 +38,16 @@ export async function POST(req: NextRequest) {
   let tempProcessedPath: string | null = null
   let uploadedGeminiFileName: string | null = null
   let aiClient: GoogleGenAI | null = null
+  let model = 'gemini-3.8-flash'
+  let keySlot: number | null = null
+  let keySelection = 'auto'
+  let customKey = ''
+  let resolvedApiKey = ''
+  let requestSentAt: number | null = null
 
   try {
     const contentType = req.headers.get('content-type') || ''
     let prompt = ''
-    let model = 'gemini-3.8-flash'
-    let keySelection = 'auto'
-    let keySlot: number | null = null
-    let customKey = ''
     let fps = 1
     let timelapse = 1
     let history: ChatHistoryItem[] = []
@@ -92,7 +94,7 @@ export async function POST(req: NextRequest) {
     }
 
     // Resolve API key from isolated chat keys store (no usage or exhaustion records tracked)
-    let resolvedApiKey = ''
+    resolvedApiKey = ''
     if (customKey) {
       resolvedApiKey = customKey
     } else if (keySelection === 'slot' && keySlot && keySlot >= 1 && keySlot <= 20) {
@@ -272,7 +274,7 @@ export async function POST(req: NextRequest) {
       parts: currentParts,
     })
 
-    const requestSentAt = Date.now()
+    requestSentAt = Date.now()
     // User instruction: Every request made in AI chat must count toward settings quota for that key and model!
     const usedToday = incrementModelUsage(model, resolvedApiKey)
 
@@ -305,21 +307,24 @@ export async function POST(req: NextRequest) {
   } catch (err: unknown) {
     console.error('[AI Chat] Request failed:', err)
     const errorMsg = err instanceof Error ? err.message : String(err)
-    const lower = errorMsg.toLowerCase()
+    const errObj = err && typeof err === 'object' ? (err as Record<string, unknown>) : null
+    const errStatus = (errObj?.status ?? (errObj?.error as Record<string, unknown>)?.code ?? (errObj?.error as Record<string, unknown>)?.status)
+    const lower = `${errorMsg} ${String(errStatus || '')}`.toLowerCase()
     const is503 = lower.includes('503') || lower.includes('high demand') || lower.includes('unavailable')
-    const is429 = lower.includes('429') || lower.includes('quota') || lower.includes('rate limit')
+    const is429 = lower.includes('429') || lower.includes('quota') || lower.includes('rate limit') || lower.includes('resource_exhausted')
     const now = Date.now()
+    const finalSentAt = requestSentAt ?? now
     return NextResponse.json(
       {
         error: errorMsg,
         is503,
         is429,
-        model: typeof model === 'string' ? model : 'gemini-3.8-flash',
+        model: model || 'gemini-3.8-flash',
         keySlot: keySlot || 1,
         keyUsed: keySlot ? `Key ${keySlot}` : 'Key 1',
-        sentAt: typeof requestSentAt === 'number' ? requestSentAt : now,
+        sentAt: finalSentAt,
         respondedAt: now,
-        durationMs: typeof requestSentAt === 'number' ? now - requestSentAt : 0,
+        durationMs: Math.max(0, now - finalSentAt),
       },
       { status: 400 },
     )
